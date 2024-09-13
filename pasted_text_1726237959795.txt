@@ -1,0 +1,539 @@
+Important Files and Code Snippets
+pages/api/create-charge.js
+
+javascript
+Copy code
+// pages/api/create-charge.js
+import axios from 'axios';
+import { getSession } from 'next-auth/react';
+import { PrismaClient } from '@prisma/client';
+import { getICD10Code } from '../../utils/icd10';
+
+const prisma = new PrismaClient();
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).send('Method Not Allowed');
+  }
+
+  const session = await getSession({ req });
+  if (!session) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  const {
+    date,
+    visitType,
+    diagnosis,
+    amount,
+    currency,
+  } = req.body;
+
+  const icd10Code = getICD10Code(diagnosis);
+
+  const API_URL = 'https://api.commerce.coinbase.com/charges';
+  const API_KEY = process.env.COINBASE_COMMERCE_API_KEY;
+
+  try {
+    // Save invoice to the database with status 'pending'
+    const invoice = await prisma.invoice.create({
+      data: {
+        patientId: session.userId,
+        date: new Date(date),
+        visitType,
+        diagnosis,
+        amount: parseFloat(amount),
+        currency,
+      },
+    });
+
+    // Create a charge on Coinbase Commerce
+    const response = await axios.post(
+      API_URL,
+      {
+        name: 'Medical Billing Payment',
+        description: `Payment for Invoice ID: ${invoice.id}`,
+        local_price: {
+          amount: amount,
+          currency: currency.toUpperCase(),
+        },
+        pricing_type: 'fixed_price',
+        metadata: {
+          invoiceId: invoice.id,
+          icd10Code,
+        },
+        redirect_url: `${process.env.NEXT_PUBLIC_BASE_URL}/success`,
+        cancel_url: `${process.env.NEXT_PUBLIC_BASE_URL}/cancel`,
+      },
+      {
+        headers: {
+          'X-CC-Api-Key': API_KEY,
+          'X-CC-Version': '2018-03-22',
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    // Update invoice with charge ID
+    await prisma.invoice.update({
+      where: { id: invoice.id },
+      data: { chargeId: response.data.data.id },
+    });
+
+    res.status(200).json({ hosted_url: response.data.data.hosted_url });
+  } catch (error) {
+    console.error(error.response?.data || error.message);
+    res.status(500).json({ error: 'Error creating charge' });
+  }
+}
+pages/api/webhook.js
+
+javascript
+Copy code
+// pages/api/webhook.js
+import { buffer } from 'micro';
+import { PrismaClient } from '@prisma/client';
+import crypto from 'crypto';
+
+const prisma = new PrismaClient();
+
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
+
+export default async function handler(req, res) {
+  const signature = req.headers['x-cc-webhook-signature'];
+  const webhookSecret = process.env.COINBASE_COMMERCE_WEBHOOK_SECRET;
+
+  const buf = await buffer(req);
+
+  const expectedSignature = crypto
+    .createHmac('sha256', webhookSecret)
+    .update(buf)
+    .digest('hex');
+
+  if (signature !== expectedSignature) {
+    return res.status(400).send('Invalid signature');
+  }
+
+  const event = JSON.parse(buf.toString());
+
+  if (event.type === 'charge:confirmed') {
+    const chargeId = event.data.id;
+
+    // Update invoice status in the database
+    await prisma.invoice.updateMany({
+      where: { chargeId },
+      data: { status: 'paid' },
+    });
+  }
+
+  res.status(200).json({ received: true });
+}
+components/LoginForm.js
+
+jsx
+Copy code
+// components/LoginForm.js
+import { signIn } from 'next-auth/react';
+import { useState } from 'react';
+
+export default function LoginForm() {
+  const [credentials, setCredentials] = useState({ email: '', password: '' });
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    await signIn('credentials', {
+      email: credentials.email,
+      password: credentials.password,
+      callbackUrl: '/dashboard',
+    });
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="max-w-md mx-auto p-4">
+      <h2 className="text-2xl mb-4">Login</h2>
+      <div className="mb-4">
+        <label className="block mb-1">Email</label>
+        <input
+          type="email"
+          className="w-full border px-3 py-2"
+          value={credentials.email}
+          onChange={(e) =>
+            setCredentials({ ...credentials, email: e.target.value })
+          }
+          required
+        />
+      </div>
+      <div className="mb-6">
+        <label className="block mb-1">Password</label>
+        <input
+          type="password"
+          className="w-full border px-3 py-2"
+          value={credentials.password}
+          onChange={(e) =>
+            setCredentials({ ...credentials, password: e.target.value })
+          }
+          required
+        />
+      </div>
+      <button type="submit" className="w-full bg-blue-500 text-white py-2">
+        Login
+      </button>
+    </form>
+  );
+}
+components/InvoiceList.js
+
+jsx
+Copy code
+// components/InvoiceList.js
+import { useSession } from 'next-auth/react';
+import { useEffect, useState } from 'react';
+import axios from 'axios';
+
+export default function InvoiceList() {
+  const { data: session } = useSession();
+  const [invoices, setInvoices] = useState([]);
+
+  useEffect(() => {
+    const fetchInvoices = async () => {
+      const response = await axios.get('/api/invoices');
+      setInvoices(response.data);
+    };
+    if (session) {
+      fetchInvoices();
+    }
+  }, [session]);
+
+  return (
+    <div className="mt-8">
+      <h2 className="text-xl mb-4">Your Invoices</h2>
+      <ul>
+        {invoices.map((invoice) => (
+          <li key={invoice.id} className="border-b py-2">
+            Date: {new Date(invoice.date).toLocaleDateString()} - Amount: {invoice.amount} {invoice.currency} - Status: {invoice.status}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+pages/api/invoices.js
+
+javascript
+Copy code
+// pages/api/invoices.js
+import { getSession } from 'next-auth/react';
+import { PrismaClient } from '@prisma/client';
+
+const prisma = new PrismaClient();
+
+export default async function handler(req, res) {
+  const session = await getSession({ req });
+  if (!session) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  const invoices = await prisma.invoice.findMany({
+    where: { patientId: session.userId },
+    orderBy: { date: 'desc' },
+  });
+
+  res.status(200).json(invoices);
+}
+pages/dashboard.js
+
+jsx
+Copy code
+// pages/dashboard.js
+import { useSession, getSession } from 'next-auth/react';
+import BillingForm from '../components/BillingForm';
+import InvoiceList from '../components/InvoiceList';
+
+export default function Dashboard() {
+  const { data: session } = useSession();
+
+  if (!session) {
+    return <div className="text-center mt-20">Loading...</div>;
+  }
+
+  return (
+    <div className="container mx-auto p-4">
+      <BillingForm />
+      <InvoiceList />
+    </div>
+  );
+}
+
+export async function getServerSideProps(context) {
+  const session = await getSession(context);
+
+  if (!session) {
+    return {
+      redirect: {
+        destination: '/',
+        permanent: false,
+      },
+    };
+  }
+
+  return {
+    props: { session },
+  };
+}
+pages/index.js
+
+jsx
+Copy code
+// pages/index.js
+import LoginForm from '../components/LoginForm';
+
+export default function Home() {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gray-100">
+      <LoginForm />
+    </div>
+  );
+}
+components/BillingForm.js
+
+Ensure that the ICD-10 code is displayed based on the diagnosis.
+
+jsx
+Copy code
+// components/BillingForm.js
+import { useState, useEffect } from 'react';
+import axios from 'axios';
+import {
+  Card,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+  CardContent,
+  CardFooter,
+} from '@/components/ui/card';
+import { Label } from '@/components/ui/label';
+import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
+import { useSession } from 'next-auth/react';
+import { getICD10Code } from '../utils/icd10';
+
+export default function BillingForm() {
+  const { data: session } = useSession();
+  const [formData, setFormData] = useState({
+    date: '',
+    visitType: '',
+    diagnosis: '',
+    amount: '',
+    currency: '',
+  });
+  const [icd10Code, setIcd10Code] = useState('');
+
+  useEffect(() => {
+    const code = getICD10Code(formData.diagnosis);
+    setIcd10Code(code);
+  }, [formData.diagnosis]);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+
+    try {
+      const response = await axios.post('/api/create-charge', formData);
+      const { hosted_url } = response.data;
+      window.location.href = hosted_url;
+    } catch (error) {
+      console.error('Payment Error:', error);
+    }
+  };
+
+  return (
+    <Card className="sm:col-span-2">
+      <CardHeader className="pb-3">
+        <CardTitle>Billing</CardTitle>
+        <CardDescription className="max-w-lg text-balance leading-relaxed">
+          Easily manage your medical billing and payments.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form className="grid gap-4" onSubmit={handleSubmit}>
+          {/* Date */}
+          <div className="grid gap-2">
+            <Label htmlFor="date">Date</Label>
+            <Input
+              id="date"
+              type="date"
+              value={formData.date}
+              onChange={(e) =>
+                setFormData({ ...formData, date: e.target.value })
+              }
+              required
+            />
+          </div>
+          {/* Visit Type */}
+          <div className="grid gap-2">
+            <Label htmlFor="visit-type">Type of Visit or Service</Label>
+            <Select
+              onValueChange={(value) =>
+                setFormData({ ...formData, visitType: value })
+              }
+              required
+            >
+              <SelectTrigger id="visit-type">
+                <SelectValue placeholder="Select type" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="Labs">Labs</SelectItem>
+                <SelectItem value="Imaging Study">Imaging Study</SelectItem>
+                <SelectItem value="Infusion">Infusion</SelectItem>
+                <SelectItem value="Referral">Referral</SelectItem>
+                <SelectItem value="Virtual">Virtual</SelectItem>
+                <SelectItem value="In-Person">In-Person</SelectItem>
+                <SelectItem value="Consultation">Consultation</SelectItem>
+                <SelectItem value="Surgery">Surgery</SelectItem>
+                <SelectItem value="Therapy">Therapy</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          {/* Diagnosis */}
+          <div className="grid gap-2">
+            <Label htmlFor="diagnosis">Diagnosis</Label>
+            <Input
+              id="diagnosis"
+              placeholder="Enter diagnosis"
+              value={formData.diagnosis}
+              onChange={(e) =>
+                setFormData({ ...formData, diagnosis: e.target.value })
+              }
+              required
+            />
+            <div className="text-xs text-muted-foreground">
+              ICD-10 code: <span id="icd10-code">{icd10Code}</span>
+            </div>
+          </div>
+          {/* Amount and Currency */}
+          <div className="grid gap-2">
+            <Label htmlFor="amount">Amount</Label>
+            <div className="flex items-center gap-2">
+              <Input
+                id="amount"
+                type="number"
+                placeholder="Enter amount"
+                value={formData.amount}
+                onChange={(e) =>
+                  setFormData({ ...formData, amount: e.target.value })
+                }
+                required
+              />
+              <Select
+                onValueChange={(value) =>
+                  setFormData({ ...formData, currency: value })
+                }
+                required
+              >
+                <SelectTrigger id="payment-type">
+                  <SelectValue placeholder="Select currency" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="USD">USD</SelectItem>
+                  <SelectItem value="BTC">BTC</SelectItem>
+                  <SelectItem value="ETH">ETH</SelectItem>
+                  <SelectItem value="USDC">USDC</SelectItem>
+                  <SelectItem value="DOGE">Dogecoin</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <Button type="submit">Submit Bill</Button>
+        </form>
+      </CardContent>
+    </Card>
+  );
+}
+Environment Variables
+Update your .env.local file:
+
+env
+Copy code
+COINBASE_COMMERCE_API_KEY=your_api_key_here
+COINBASE_COMMERCE_WEBHOOK_SECRET=your_webhook_secret_here
+NEXTAUTH_SECRET=your_nextauth_secret
+NEXTAUTH_URL=http://localhost:3000
+NEXT_PUBLIC_BASE_URL=http://localhost:3000
+Note: Replace your_api_key_here, your_webhook_secret_here, and your_nextauth_secret with your actual keys and secrets.
+
+Tailwind CSS Configuration
+Ensure that your tailwind.config.js includes the necessary content paths:
+
+javascript
+Copy code
+// tailwind.config.js
+module.exports = {
+  content: [
+    './pages/**/*.{js,jsx}',
+    './components/**/*.{js,jsx}',
+    // Add other paths as needed
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+};
+Global Styles
+In styles/globals.css:
+
+css
+Copy code
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Add any custom styles here */
+Running the Application
+
+Generate Prisma Client
+bash
+Copy code
+npx prisma generate
+Start the Development Server
+bash
+Copy code
+npm run dev
+Access the Application
+Open http://localhost:3000 in your browser.
+Create a User
+Since we haven't implemented a sign-up form, you can create a user directly in the database using a script or the Prisma Studio.
+
+Using Prisma Studio:
+
+bash
+Copy code
+npx prisma studio
+This opens a web interface where you can create a new patient. Make sure to hash the password using bcryptjs before saving.
+
+Hashing Password:
+
+javascript
+Copy code
+// Run this in Node.js REPL or create a script
+const { hash } = require('bcryptjs');
+hash('yourpassword', 10).then(console.log);
+Use the hashed password when creating the user in Prisma Studio.
+Notes and Best Practices
+
+Security: Always hash passwords before storing them. Use HTTPS in production.
+Sensitive Data: Do not expose API keys or secrets in client-side code.
+Validation: Implement proper validation and error handling for all inputs and API routes.
+Compliance: Ensure compliance with HIPAA or other regulations when handling medical data.
+Logging: Avoid logging sensitive information. Use proper logging levels and redact sensitive data.
+Next Steps
+
+Implement Sign-Up Functionality: Allow users to register through the application.
+Enhance Error Handling: Provide user-friendly error messages and handle edge cases.
+Replace Mocked ICD-10 Integration: Integrate with a real ICD-10 API for accurate codes.
+UI/UX Improvements: Enhance the user interface for better usability.
+Email Notifications: Send email confirmations upon successful payment.
+Testing: Write unit and integration tests for your application.
